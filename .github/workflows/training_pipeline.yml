@@ -1,0 +1,78 @@
+name: Daily Training Pipeline
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # every day at 2:00 AM UTC (7 AM PKT)
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  run-training-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60     # training can take a while
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-training-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-training-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy scikit-learn hopsworks joblib python-dotenv
+          pip install tensorflow          # for LSTM model
+          pip install shap                # for feature importance
+
+      - name: Run backfill (fetch latest data from Open-Meteo)
+        env:
+          USE_HOPSWORKS: "true"
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+        run: python backfill_open_meteo.py
+
+      - name: Run feature pipeline (engineer features + upload)
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          USE_HOPSWORKS:     "true"
+        run: python feature_pipeline.py
+
+      - name: Run training pipeline (train + register best model)
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          USE_HOPSWORKS:     "true"
+        run: |
+          # Convert notebook to script and run it
+          pip install nbconvert jupyter
+          jupyter nbconvert --to script training_pipeline_colab_1_.ipynb --output training_script
+          python training_script.py
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-models-${{ github.run_number }}
+          path: |
+            random_forest_model.pkl
+            lstm_model.keras
+            scaler_X.pkl
+            scaler_y.pkl
+            feature_cols.json
+            *.png
+          retention-days: 7
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-logs
+          path: "*.log"
+          retention-days: 3

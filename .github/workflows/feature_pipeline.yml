@@ -1,0 +1,55 @@
+name: Hourly Feature Pipeline
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # every hour at :00
+  workflow_dispatch:        # allow manual trigger from GitHub UI
+
+jobs:
+  run-feature-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-feature-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-feature-
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas numpy hopsworks python-dotenv
+
+      - name: Run feature pipeline (backfill latest hour)
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          AQICN_TOKEN:       ${{ secrets.AQICN_TOKEN }}
+          USE_HOPSWORKS:     "true"
+        run: python feature_pipeline.py
+
+      - name: Run inference pipeline (predict next 24/48/72h)
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          AQICN_TOKEN:       ${{ secrets.AQICN_TOKEN }}
+          USE_HOPSWORKS:     "true"
+        run: python inference_pipeline.py
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-pipeline-logs
+          path: "*.log"
+          retention-days: 3

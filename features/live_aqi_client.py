@@ -1,28 +1,26 @@
 """
-api_client.py
-=============
-PURPOSE : Fetch the latest AQI reading from AQICN for a given city.
-          Used by the feature pipeline on every hourly run.
+live_aqi_client.py
+==================
+PURPOSE : Fetch LIVE AQI for Lahore by averaging multiple monitoring stations.
 
-DESIGN DECISIONS (senior notes for junior devs):
-  - City is a parameter, not a global constant → function is reusable + testable
-  - Retry logic with exponential back-off → survives transient network errors
-  - All timestamps normalised to UTC ISO-8601 → merges with Open-Meteo cleanly
-  - Structured logging (not print) → grep-able in production logs
-  - No API key in source code → always via environment variable
-  - Returns typed dict via TypedDict → downstream code knows what fields exist
+WHY AVERAGE MULTIPLE STATIONS?
+  A single station can be down, malfunctioning, or locally unrepresentative.
+  Averaging across stations gives a city-wide reading that is more robust
+  and matches how official city AQI values are typically reported.
 
-INSTALL:
+STATIONS USED (Lahore):
+  - lahore              → main city station
+  - lahore/us-consulate → US Embassy reference monitor (often most accurate)
+  - lahore/gulberg      → residential area monitor
+
+HOW TO RUN:
   pip install requests python-dotenv
-
-USAGE:
-  from features.api_client import fetch_aqi
-  row = fetch_aqi("lahore")
+  export AQICN_TOKEN=your_token_here
+  python live_aqi_client.py
 """
 
 import logging
 import os
-import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -30,159 +28,179 @@ import requests
 from dotenv import load_dotenv
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-# Use module-level logger, not print().
-# Callers (pipeline scripts) configure the root logger with level + handler.
-# This module just emits — it never decides where logs go.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
-_AQICN_TOKEN: str = os.environ["AQICN_TOKEN"]   # KeyError = fail fast at startup
+_AQICN_TOKEN: str = os.environ["AQICN_TOKEN"]
 _BASE_URL = "https://api.waqi.info/feed"
 
-# Retry settings
+# All known Lahore monitoring stations
+LAHORE_STATIONS = [
+    "lahore",
+    "lahore/us-consulate",
+    "lahore/gulberg",
+]
+
 _MAX_RETRIES = 3
-_BACKOFF_BASE = 2   # seconds; waits 2s, 4s, 8s between attempts
+_BACKOFF_BASE = 2
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _safe_iaqi(iaqi: dict, field: str) -> Optional[float]:
-    """
-    Extract a numeric value from AQICN's iaqi sub-dict.
-
-    AQICN returns:  "iaqi": { "pm25": {"v": 145.0}, "no2": {"v": "-"} }
-    We want:        145.0  or  None
-
-    WHY Optional[float] and not int?
-    AQI sub-indices are floats in the API (e.g. 145.3).
-    Using float avoids silent precision loss.
-    """
     raw = iaqi.get(field, {}).get("v")
     if raw is None or raw == "-":
         return None
     try:
         return float(raw)
     except (TypeError, ValueError):
-        logger.warning("Unexpected iaqi value for %s: %r", field, raw)
         return None
 
 
-def _parse_station_time(time_str: str) -> str:
+def _fetch_single_station(city: str) -> Optional[dict]:
     """
-    Convert AQICN station timestamp → UTC ISO-8601 string.
-
-    AQICN returns local-time strings like "2024-11-15 14:00:00"
-    with NO timezone offset, and the station is in Lahore (PKT = UTC+5).
-
-    If we store this as-is and later merge with Open-Meteo (which we stored
-    in UTC), every join will be silently off by 5 hours — a data-quality
-    disaster that's hard to debug.
-
-    Fix: assume PKT, convert to UTC.
+    Fetch AQI data for one station slug. Returns None on any failure
+    so the caller can skip it and use the other stations.
     """
-    from datetime import timedelta
-    PKT_OFFSET = timedelta(hours=5)
+    import time
+    url = f"{_BASE_URL}/{city}/"
+    params = {"token": _AQICN_TOKEN}
 
-    try:
-        local_dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        utc_dt = local_dt - PKT_OFFSET
-        return utc_dt.replace(tzinfo=timezone.utc).isoformat()
-    except ValueError:
-        # If format ever changes, return the raw string and log a warning
-        logger.warning("Could not parse station time %r — storing raw", time_str)
-        return time_str
+    last_exc = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            break
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            wait = _BACKOFF_BASE ** attempt
+            logger.warning("Station %s attempt %d failed: %s. Retrying in %ds…",
+                           city, attempt, exc, wait)
+            time.sleep(wait)
+    else:
+        logger.error("All retries failed for station %s: %s", city, last_exc)
+        return None
+
+    payload = response.json()
+    if payload.get("status") != "ok":
+        logger.warning("AQICN returned non-ok status for %s: %s", city, payload.get("status"))
+        return None
+
+    station = payload["data"]
+    iaqi = station.get("iaqi", {})
+    raw_aqi = station.get("aqi")
+    aqi_value = float(raw_aqi) if isinstance(raw_aqi, (int, float)) else None
+
+    if aqi_value is None:
+        logger.warning("Station %s returned no numeric AQI, skipping.", city)
+        return None
+
+    return {
+        "station":    city,
+        "aqi":        aqi_value,
+        "pm25":       _safe_iaqi(iaqi, "pm25"),
+        "pm10":       _safe_iaqi(iaqi, "pm10"),
+        "no2":        _safe_iaqi(iaqi, "no2"),
+        "co":         _safe_iaqi(iaqi, "co"),
+        "o3":         _safe_iaqi(iaqi, "o3"),
+        "so2":        _safe_iaqi(iaqi, "so2"),
+        "humidity":   _safe_iaqi(iaqi, "h"),
+        "temp":       _safe_iaqi(iaqi, "t"),
+        "wind":       _safe_iaqi(iaqi, "w"),
+        "pressure":   _safe_iaqi(iaqi, "p"),
+        "dominant_pollutant": station.get("dominentpol"),
+    }
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def fetch_aqi(city: str) -> dict:
+def fetch_lahore_aqi_average(stations: list = None) -> dict:
     """
-    Fetch the latest AQI data for *city* from AQICN.
+    Fetch AQI from multiple Lahore stations and return an averaged reading.
 
     Parameters
     ----------
-    city : str
-        AQICN city slug, e.g. "lahore", "karachi", "islamabad".
+    stations : list, optional
+        List of AQICN station slugs. Defaults to LAHORE_STATIONS.
 
     Returns
     -------
     dict with keys:
-        timestamp_utc, fetch_utc, city, aqi, pm25, pm10, no2,
-        co, o3, so2, humidity, temp, wind, pressure, dominant_pollutant
+        timestamp_utc, city, aqi, pm25, pm10, no2, co, o3, so2,
+        humidity, temp, wind, pressure, dominant_pollutant,
+        stations_used, stations_attempted
 
-    Raises
-    ------
-    requests.HTTPError   — on 4xx/5xx responses after all retries
-    RuntimeError         — if AQICN returns status != "ok"
+    Notes
+    -----
+    - Numeric fields are averaged across all responding stations.
+    - Non-numeric fields (dominant_pollutant) use the value from the
+      station with the highest AQI reading (most representative).
+    - If ALL stations fail, raises RuntimeError.
     """
-    url = f"{_BASE_URL}/{city}/"
-    params = {"token": _AQICN_TOKEN}
+    if stations is None:
+        stations = LAHORE_STATIONS
 
-    # ── Retry loop with exponential back-off ──────────────────────────────────
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, _MAX_RETRIES + 1):
-        try:
-            logger.debug("Fetching AQI for %s (attempt %d/%d)", city, attempt, _MAX_RETRIES)
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            break                          # success — exit retry loop
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            wait = _BACKOFF_BASE ** attempt
-            logger.warning("Request failed (attempt %d): %s. Retrying in %ds…", attempt, exc, wait)
-            time.sleep(wait)
-    else:
-        # All retries exhausted
-        raise RuntimeError(f"All {_MAX_RETRIES} attempts failed for {city}") from last_exc
+    logger.info("Fetching AQI from %d Lahore stations: %s", len(stations), stations)
 
-    payload = response.json()
+    readings = []
+    for station_slug in stations:
+        result = _fetch_single_station(station_slug)
+        if result is not None:
+            readings.append(result)
+            logger.info("  %-30s  AQI=%s", station_slug, result["aqi"])
 
-    if payload.get("status") != "ok":
-        raise RuntimeError(f"AQICN API error for {city!r}: {payload}")
+    if not readings:
+        raise RuntimeError(
+            f"All {len(stations)} Lahore stations failed. "
+            "Check your AQICN_TOKEN and internet connection."
+        )
 
-    station = payload["data"]
-    iaqi    = station.get("iaqi", {})
+    # ── Average numeric fields across all responding stations ─────────────────
+    numeric_fields = ["aqi", "pm25", "pm10", "no2", "co", "o3", "so2",
+                      "humidity", "temp", "wind", "pressure"]
 
-    # AQI can be an int, float, or the string "-" when the station has no data
-    raw_aqi = station.get("aqi")
-    aqi_value: Optional[float] = float(raw_aqi) if isinstance(raw_aqi, (int, float)) else None
+    averaged = {}
+    for field in numeric_fields:
+        values = [r[field] for r in readings if r[field] is not None]
+        averaged[field] = round(sum(values) / len(values), 1) if values else None
+
+    # dominant_pollutant → from the station reporting highest AQI
+    best_station = max(readings, key=lambda r: r["aqi"])
+    averaged["dominant_pollutant"] = best_station["dominant_pollutant"]
 
     result = {
-        # Always store time in UTC — avoids timezone bugs in every downstream step
-        "timestamp_utc":      _parse_station_time(station["time"]["s"]),
-        "fetch_utc":          datetime.now(timezone.utc).isoformat(),
-        "city":               city,
-        "aqi":                aqi_value,
-        "pm25":               _safe_iaqi(iaqi, "pm25"),
-        "pm10":               _safe_iaqi(iaqi, "pm10"),
-        "no2":                _safe_iaqi(iaqi, "no2"),
-        "co":                 _safe_iaqi(iaqi, "co"),
-        "o3":                 _safe_iaqi(iaqi, "o3"),
-        "so2":                _safe_iaqi(iaqi, "so2"),
-        "humidity":           _safe_iaqi(iaqi, "h"),
-        "temp":               _safe_iaqi(iaqi, "t"),
-        "wind":               _safe_iaqi(iaqi, "w"),
-        "pressure":           _safe_iaqi(iaqi, "p"),
-        "dominant_pollutant": station.get("dominentpol"),  # note: AQICN typo preserved
+        "timestamp_utc":      datetime.now(timezone.utc).isoformat(),
+        "city":               "lahore",
+        "stations_used":      len(readings),
+        "stations_attempted": len(stations),
+        "station_readings":   [{"station": r["station"], "aqi": r["aqi"]} for r in readings],
+        **averaged,
     }
 
     logger.info(
-        "Fetched AQI for %s: aqi=%s, pm25=%s (at %s)",
-        city, result["aqi"], result["pm25"], result["timestamp_utc"]
+        "Lahore averaged AQI: %.1f  (from %d/%d stations)",
+        averaged["aqi"] or 0,
+        len(readings),
+        len(stations),
     )
     return result
 
 
 # ── Manual test ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # When running directly, configure basic logging so you can see output
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
-    )
-    data = fetch_aqi("lahore")
-    print("\n✅ Live Lahore AQI Data:")
-    for key, value in data.items():
-        print(f"  {key:25s}: {value}")
+    data = fetch_lahore_aqi_average()
+    print("\n✅ Lahore City-Wide AQI (Multi-Station Average):")
+    print(f"  Timestamp : {data['timestamp_utc']}")
+    print(f"  Stations  : {data['stations_used']}/{data['stations_attempted']} responded")
+    for s in data.get("station_readings", []):
+        print(f"    {s['station']:<35} AQI = {s['aqi']}")
+    print(f"\n  City Average AQI  : {data['aqi']}")
+    print(f"  PM2.5             : {data['pm25']}")
+    print(f"  PM10              : {data['pm10']}")
+    print(f"  Dominant Pollutant: {data['dominant_pollutant']}")
