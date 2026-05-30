@@ -28,23 +28,20 @@ jobs:
             ${{ runner.os }}-pip-feature-
 
       - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          pip install requests pandas numpy hopsworks python-dotenv
+        run: pip install -r requirements.txt
 
-      - name: Run feature pipeline (backfill latest hour)
+      - name: Run feature pipeline (engineer features + upload to Hopsworks)
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
-          AQICN_TOKEN:       ${{ secrets.AQICN_TOKEN }}
           USE_HOPSWORKS:     "true"
-        run: python feature_pipeline.py
+        run: python pipelines/feature_pipeline.py
 
       - name: Run inference pipeline (predict next 24/48/72h)
         env:
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           AQICN_TOKEN:       ${{ secrets.AQICN_TOKEN }}
           USE_HOPSWORKS:     "true"
-        run: python inference_pipeline.py
+        run: python pipelines/inference_pipeline.py
 
       - name: Upload logs on failure
         if: failure()
