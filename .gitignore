@@ -1,6 +1,33 @@
-"venv/" 
-".venv/" 
-".env" 
-"*.csv" 
-"__pycache__/" 
-"*.pyc" 
+# Virtual environment
+venv/
+.venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files
+*.csv
+
+# ML model files
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+models/
+pipelines/models/
+
+# Binary/compiled files
+*.dll
+*.pyd
+*.so
+*.exe
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
