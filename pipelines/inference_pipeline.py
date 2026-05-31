@@ -78,25 +78,83 @@ AQI_CATEGORIES = [
 
 # ── Step 1: Load feature columns ──────────────────────────────────────────────
 
+# These are always excluded from the feature matrix — they are either
+# identifiers, raw targets, or leaky columns the model must never see.
+_EXCLUDE_ALWAYS = {
+    "timestamp", "city",
+    "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
+    "us_aqi", "us_aqi_pm2_5",
+}
+
+
 def load_feature_cols() -> list:
+    """
+    Load the list of feature columns used at training time.
+
+    Priority order (most reliable → least):
+      1. Local feature_cols.json  — written by training_pipeline.py
+      2. Hopsworks feature group schema  — always available after first upload
+      3. Local lahore_features.csv header  — dev/offline fallback only
+
+    On the GitHub Actions runner the workspace is FRESH every run, so
+    local files from previous jobs never exist. Hopsworks (option 2) is
+    therefore the primary source for the hourly inference job.
+    """
+    # ── Option 1: local JSON (exists when training ran in the same job) ───────
     if Path(FEATURE_COLS_JSON).exists():
         with open(FEATURE_COLS_JSON) as f:
             cols = json.load(f)
         logger.info("Loaded %d feature columns from %s", len(cols), FEATURE_COLS_JSON)
         return cols
 
-    logger.warning("%s not found — deriving feature cols from CSV.", FEATURE_COLS_JSON)
-    if not Path(LOCAL_FEATURES_CSV).exists():
-        raise FileNotFoundError(
-            f"Neither {FEATURE_COLS_JSON} nor {LOCAL_FEATURES_CSV} found.\n"
-            "Run feature_pipeline.py first."
-        )
-    df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
-    exclude = {"timestamp", "city", "target_aqi_24h", "target_aqi_48h",
-               "target_aqi_72h", "us_aqi", "us_aqi_pm2_5"}
-    cols = [c for c in df.columns if c not in exclude]
-    logger.info("Derived %d feature columns from CSV", len(cols))
-    return cols
+    # ── Option 2: derive from Hopsworks feature group schema ──────────────────
+    # The feature group is always present after the first successful upload.
+    # Reading just the schema (get_feature_group) does NOT download data — fast.
+    if USE_HOPSWORKS and HOPSWORKS_API_KEY:
+        try:
+            import hopsworks
+            logger.info(
+                "feature_cols.json not found locally — deriving schema from Hopsworks..."
+            )
+            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+            fs = project.get_feature_store()
+            fg = fs.get_feature_group(
+                name=FEATURE_GROUP_NAME,
+                version=FEATURE_GROUP_VERSION,
+            )
+            # fg.schema returns a list of hsfs.feature.Feature objects
+            all_cols = [f.name for f in fg.schema]
+            cols = [c for c in all_cols if c not in _EXCLUDE_ALWAYS]
+            logger.info(
+                "Derived %d feature columns from Hopsworks '%s' schema",
+                len(cols), FEATURE_GROUP_NAME,
+            )
+            # Cache locally so the next step in the same job can use it
+            Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
+            with open(FEATURE_COLS_JSON, "w") as f:
+                json.dump(cols, f)
+            logger.info("Cached feature_cols.json to %s for this run", FEATURE_COLS_JSON)
+            return cols
+        except Exception as exc:
+            logger.warning(
+                "Hopsworks schema read failed (%s) — trying local CSV fallback.", exc
+            )
+
+    # ── Option 3: local CSV header (dev / offline only) ───────────────────────
+    if Path(LOCAL_FEATURES_CSV).exists():
+        logger.warning("Deriving feature cols from local CSV header (dev fallback).")
+        df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
+        cols = [c for c in df.columns if c not in _EXCLUDE_ALWAYS]
+        logger.info("Derived %d feature columns from CSV", len(cols))
+        return cols
+
+    raise FileNotFoundError(
+        "Cannot determine feature columns.\n"
+        f"  • {FEATURE_COLS_JSON} — not found\n"
+        f"  • Hopsworks schema read — failed (check HOPSWORKS_API_KEY secret)\n"
+        f"  • {LOCAL_FEATURES_CSV} — not found\n"
+        "Ensure the feature_pipeline step ran before inference_pipeline."
+    )
 
 
 # ── Step 2: Load model — Hopsworks first, local fallback ─────────────────────
