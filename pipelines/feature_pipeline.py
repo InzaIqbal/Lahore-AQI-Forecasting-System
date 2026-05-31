@@ -262,7 +262,19 @@ def upload_to_hopsworks(df: pd.DataFrame) -> None:
             description="Hourly AQI features for Lahore: lag, rolling, change, targets",
             event_time="timestamp",
         )
-        fg.insert(df, write_options={"wait_for_job": True})
+        # write_options explanation:
+        #   "start_offline_backfill": True  — use batch/offline write, NOT Kafka streaming.
+        #     This avoids the confluent-kafka dependency entirely. The data lands in the
+        #     offline (Hive/Parquet) store which is what training_pipeline.py reads.
+        #   "wait_for_job": True            — block until the Hopsworks job finishes,
+        #     so the next pipeline step sees the data immediately.
+        fg.insert(
+            df,
+            write_options={
+                "start_offline_backfill": True,
+                "wait_for_job": True,
+            },
+        )
         logger.info(
             "✅ Successfully uploaded %d rows to Hopsworks 'lahore_aqi_features'", len(df)
         )
