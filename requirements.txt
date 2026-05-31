@@ -10,13 +10,13 @@ scipy>=1.11.0
 tensorflow>=2.15.0,<2.22.0
 keras>=3.0.0
 
-# ── Protobuf — MUST be pinned before hopsworks pulls it ──────────────────────
-# hopsworks 4.7.4 requires protobuf>=4.25.4,<5.0.0
-# tensorflow 2.x also needs <5.0.0 on this version range
+# ── Protobuf — pinned BEFORE hopsworks resolution ────────────────────────────
+# hopsworks 4.7.x requires protobuf>=4.25.4,<5.0.0
 protobuf>=4.25.4,<5.0.0
 
-# ── Feature store ─────────────────────────────────────────────────────────────
-hopsworks>=4.7.0,<5.0.0
+# ── Feature store — pinned to match backend version 4.7.2 ────────────────────
+# hopsworks[python] pulls in confluent-kafka automatically (fixes Kafka error)
+hopsworks[python]==4.7.*
 
 # ── HTTP & APIs ───────────────────────────────────────────────────────────────
 requests>=2.31.0
