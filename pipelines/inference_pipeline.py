@@ -276,7 +276,13 @@ def store_predictions_hopsworks(api_key: str, prediction_row: dict) -> None:
     )
     df_pred = pd.DataFrame([prediction_row])
     df_pred["forecast_created_utc"] = pd.to_datetime(df_pred["forecast_created_utc"])
-    fg.insert(df_pred, write_options={"wait_for_job": True})
+    fg.insert(
+        df_pred,
+        write_options={
+            "start_offline_backfill": True,
+            "wait_for_job": True,
+        },
+    )
     logger.info("Stored prediction to Hopsworks '%s'", PRED_GROUP_NAME)
 
 
