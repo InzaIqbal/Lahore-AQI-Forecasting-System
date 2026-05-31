@@ -79,93 +79,64 @@ AQI_CATEGORIES = [
 # ── Step 1: Load feature columns ──────────────────────────────────────────────
 
 def load_feature_cols() -> list:
-    """
-    Load the EXACT feature columns the model was trained on.
-
-    Priority:
-      1. Local feature_cols.json  — present when training ran in the same job
-      2. Download feature_cols.json from Hopsworks Model Registry artifact
-         (the file is uploaded there by training_pipeline.py — always correct)
-      3. Local lahore_features.csv header — dev/offline only
-
-    WHY NOT derive from the feature group schema?
-      The feature group has 53 columns; training excluded 7+ of them
-      (timestamp, city, targets, us_aqi, us_aqi_pm2_5, and potentially
-      others with high NaN rates). Reading the schema gives 46 columns
-      but the model saw only 43 → shape mismatch crash at predict time.
-      The feature_cols.json written during training is the only safe source.
-    """
-    # ── Option 1: local JSON (same job as training, or cached from prev step) ─
+    """Fallback feature col loader for Ridge/LSTM models that don't store names."""
+    _EXCLUDE = {
+        "timestamp", "city",
+        "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
+        "us_aqi", "us_aqi_pm2_5",
+    }
     if Path(FEATURE_COLS_JSON).exists():
         with open(FEATURE_COLS_JSON) as f:
             cols = json.load(f)
-        logger.info("Loaded %d feature columns from local %s", len(cols), FEATURE_COLS_JSON)
+        logger.info("Loaded %d feature columns from %s", len(cols), FEATURE_COLS_JSON)
         return cols
 
-    # ── Option 2: download from Hopsworks Model Registry artifact ─────────────
-    # training_pipeline.py copies feature_cols.json into the staging folder
-    # before calling model_obj.save(), so it is always inside the model artifact.
-    if USE_HOPSWORKS and HOPSWORKS_API_KEY:
-        try:
-            import hopsworks
-            logger.info(
-                "feature_cols.json not found locally — downloading from "
-                "Hopsworks Model Registry (lahore_aqi_best_24h)..."
-            )
-            project  = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
-            mr       = project.get_model_registry()
-            # All three horizon models contain the same feature_cols.json,
-            # so we only need to download one (24h is always trained first).
-            hw_model = mr.get_model(name="lahore_aqi_best_24h", version=1)
-            save_dir = hw_model.download()   # downloads the whole artifact folder
-            downloaded_json = os.path.join(save_dir, "feature_cols.json")
-            if os.path.exists(downloaded_json):
-                with open(downloaded_json) as f:
-                    cols = json.load(f)
-                # Cache it locally so subsequent calls in this job are instant
-                Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
-                with open(FEATURE_COLS_JSON, "w") as f:
-                    json.dump(cols, f)
-                logger.info(
-                    "Downloaded feature_cols.json from Hopsworks: %d columns", len(cols)
-                )
-                return cols
-            else:
-                logger.warning(
-                    "feature_cols.json not found inside model artifact at %s. "
-                    "Re-run training_pipeline.py to re-register the model.",
-                    save_dir,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Hopsworks model artifact download failed (%s) — "
-                "trying local CSV fallback.", exc,
-            )
-
-    # ── Option 3: local CSV header (dev/offline only) ─────────────────────────
+    logger.warning("%s not found — deriving feature cols from CSV.", FEATURE_COLS_JSON)
     if Path(LOCAL_FEATURES_CSV).exists():
-        logger.warning(
-            "Falling back to local CSV header for feature cols. "
-            "This may not match the trained model if columns changed."
-        )
-        _EXCLUDE = {
-            "timestamp", "city",
-            "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
-            "us_aqi", "us_aqi_pm2_5",
-        }
         df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
         cols = [c for c in df.columns if c not in _EXCLUDE]
         logger.info("Derived %d feature columns from CSV header", len(cols))
         return cols
 
     raise FileNotFoundError(
-        "Cannot determine feature columns. Tried:\n"
-        f"  1. {FEATURE_COLS_JSON}  — not found\n"
-        f"  2. Hopsworks model artifact 'lahore_aqi_best_24h'  — failed\n"
-        f"  3. {LOCAL_FEATURES_CSV}  — not found\n\n"
-        "Fix: re-run training_pipeline.py so feature_cols.json is uploaded "
-        "to the Hopsworks Model Registry, then retry inference."
+        f"Cannot load feature columns: {FEATURE_COLS_JSON} and "
+        f"{LOCAL_FEATURES_CSV} both missing."
     )
+
+
+def get_feature_cols_from_model(model_type: str, model) -> list:
+    """
+    Extract the EXACT feature names the model was trained on from the
+    model object itself. This is the only 100% reliable source and fixes
+    the 'expected 43 got 46' mismatch when feature_cols.json drifts.
+
+    XGBoost stores feature names in the booster at fit() time.
+    RandomForest stores them in feature_names_in_.
+    Ridge/LSTM do not store names — returns None, caller uses fallback.
+    """
+    try:
+        if model_type == "xgb":
+            names = model.get_booster().feature_names
+            if names:
+                logger.info(
+                    "Got %d feature names from XGBoost booster (authoritative)",
+                    len(names),
+                )
+                return names
+
+        if model_type == "rf":
+            if hasattr(model, "feature_names_in_"):
+                names = list(model.feature_names_in_)
+                logger.info(
+                    "Got %d feature names from RandomForest.feature_names_in_",
+                    len(names),
+                )
+                return names
+
+    except Exception as exc:
+        logger.warning("Could not extract feature names from model: %s", exc)
+
+    return None  # Ridge / LSTM — caller falls back to load_feature_cols()
 
 
 # ── Step 2: Load model — Hopsworks first, local fallback ─────────────────────
@@ -415,9 +386,11 @@ def main() -> None:
         live_aqi  = 0.0
         live_data = {}
 
-    feature_cols = load_feature_cols()
-
-    # CHANGE 3: Load models — Hopsworks primary, local fallback
+    # Load models first — we derive feature cols FROM the model itself.
+    # This is the only guaranteed-correct source: XGBoost stores the exact
+    # column names it was trained on in get_booster().feature_names.
+    # Any other approach (JSON file, schema, CSV header) can drift and cause
+    # the 'expected 43 got 46' shape mismatch.
     models = {}
     for horizon_h in [24, 48, 72]:
         logger.info("Loading model for %dh...", horizon_h)
@@ -429,6 +402,15 @@ def main() -> None:
             model_type, model, scaler_X, scaler_y = load_model_from_local(horizon_h)
         models[horizon_h] = (model_type, model, scaler_X, scaler_y)
         logger.info("  %dh → %s", horizon_h, model_type)
+
+    # Derive feature cols from the 24h model (all horizons trained on same cols).
+    # Falls back to load_feature_cols() for Ridge/LSTM which don't store names.
+    _mt, _m, _, _ = models[24]
+    feature_cols = get_feature_cols_from_model(_mt, _m)
+    if feature_cols is None:
+        logger.info("Model type '%s' doesn't store feature names — using JSON/CSV fallback", _mt)
+        feature_cols = load_feature_cols()
+    logger.info("Using %d feature columns (source: %s model)", len(feature_cols), _mt)
 
     # Load features
     df_features = load_latest_features()
