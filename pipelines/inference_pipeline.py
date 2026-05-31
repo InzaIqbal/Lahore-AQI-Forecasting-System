@@ -78,82 +78,93 @@ AQI_CATEGORIES = [
 
 # ── Step 1: Load feature columns ──────────────────────────────────────────────
 
-# These are always excluded from the feature matrix — they are either
-# identifiers, raw targets, or leaky columns the model must never see.
-_EXCLUDE_ALWAYS = {
-    "timestamp", "city",
-    "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
-    "us_aqi", "us_aqi_pm2_5",
-}
-
-
 def load_feature_cols() -> list:
     """
-    Load the list of feature columns used at training time.
+    Load the EXACT feature columns the model was trained on.
 
-    Priority order (most reliable → least):
-      1. Local feature_cols.json  — written by training_pipeline.py
-      2. Hopsworks feature group schema  — always available after first upload
-      3. Local lahore_features.csv header  — dev/offline fallback only
+    Priority:
+      1. Local feature_cols.json  — present when training ran in the same job
+      2. Download feature_cols.json from Hopsworks Model Registry artifact
+         (the file is uploaded there by training_pipeline.py — always correct)
+      3. Local lahore_features.csv header — dev/offline only
 
-    On the GitHub Actions runner the workspace is FRESH every run, so
-    local files from previous jobs never exist. Hopsworks (option 2) is
-    therefore the primary source for the hourly inference job.
+    WHY NOT derive from the feature group schema?
+      The feature group has 53 columns; training excluded 7+ of them
+      (timestamp, city, targets, us_aqi, us_aqi_pm2_5, and potentially
+      others with high NaN rates). Reading the schema gives 46 columns
+      but the model saw only 43 → shape mismatch crash at predict time.
+      The feature_cols.json written during training is the only safe source.
     """
-    # ── Option 1: local JSON (exists when training ran in the same job) ───────
+    # ── Option 1: local JSON (same job as training, or cached from prev step) ─
     if Path(FEATURE_COLS_JSON).exists():
         with open(FEATURE_COLS_JSON) as f:
             cols = json.load(f)
-        logger.info("Loaded %d feature columns from %s", len(cols), FEATURE_COLS_JSON)
+        logger.info("Loaded %d feature columns from local %s", len(cols), FEATURE_COLS_JSON)
         return cols
 
-    # ── Option 2: derive from Hopsworks feature group schema ──────────────────
-    # The feature group is always present after the first successful upload.
-    # Reading just the schema (get_feature_group) does NOT download data — fast.
+    # ── Option 2: download from Hopsworks Model Registry artifact ─────────────
+    # training_pipeline.py copies feature_cols.json into the staging folder
+    # before calling model_obj.save(), so it is always inside the model artifact.
     if USE_HOPSWORKS and HOPSWORKS_API_KEY:
         try:
             import hopsworks
             logger.info(
-                "feature_cols.json not found locally — deriving schema from Hopsworks..."
+                "feature_cols.json not found locally — downloading from "
+                "Hopsworks Model Registry (lahore_aqi_best_24h)..."
             )
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
-            fs = project.get_feature_store()
-            fg = fs.get_feature_group(
-                name=FEATURE_GROUP_NAME,
-                version=FEATURE_GROUP_VERSION,
-            )
-            # fg.schema returns a list of hsfs.feature.Feature objects
-            all_cols = [f.name for f in fg.schema]
-            cols = [c for c in all_cols if c not in _EXCLUDE_ALWAYS]
-            logger.info(
-                "Derived %d feature columns from Hopsworks '%s' schema",
-                len(cols), FEATURE_GROUP_NAME,
-            )
-            # Cache locally so the next step in the same job can use it
-            Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
-            with open(FEATURE_COLS_JSON, "w") as f:
-                json.dump(cols, f)
-            logger.info("Cached feature_cols.json to %s for this run", FEATURE_COLS_JSON)
-            return cols
+            project  = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+            mr       = project.get_model_registry()
+            # All three horizon models contain the same feature_cols.json,
+            # so we only need to download one (24h is always trained first).
+            hw_model = mr.get_model(name="lahore_aqi_best_24h", version=1)
+            save_dir = hw_model.download()   # downloads the whole artifact folder
+            downloaded_json = os.path.join(save_dir, "feature_cols.json")
+            if os.path.exists(downloaded_json):
+                with open(downloaded_json) as f:
+                    cols = json.load(f)
+                # Cache it locally so subsequent calls in this job are instant
+                Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
+                with open(FEATURE_COLS_JSON, "w") as f:
+                    json.dump(cols, f)
+                logger.info(
+                    "Downloaded feature_cols.json from Hopsworks: %d columns", len(cols)
+                )
+                return cols
+            else:
+                logger.warning(
+                    "feature_cols.json not found inside model artifact at %s. "
+                    "Re-run training_pipeline.py to re-register the model.",
+                    save_dir,
+                )
         except Exception as exc:
             logger.warning(
-                "Hopsworks schema read failed (%s) — trying local CSV fallback.", exc
+                "Hopsworks model artifact download failed (%s) — "
+                "trying local CSV fallback.", exc,
             )
 
-    # ── Option 3: local CSV header (dev / offline only) ───────────────────────
+    # ── Option 3: local CSV header (dev/offline only) ─────────────────────────
     if Path(LOCAL_FEATURES_CSV).exists():
-        logger.warning("Deriving feature cols from local CSV header (dev fallback).")
+        logger.warning(
+            "Falling back to local CSV header for feature cols. "
+            "This may not match the trained model if columns changed."
+        )
+        _EXCLUDE = {
+            "timestamp", "city",
+            "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
+            "us_aqi", "us_aqi_pm2_5",
+        }
         df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
-        cols = [c for c in df.columns if c not in _EXCLUDE_ALWAYS]
-        logger.info("Derived %d feature columns from CSV", len(cols))
+        cols = [c for c in df.columns if c not in _EXCLUDE]
+        logger.info("Derived %d feature columns from CSV header", len(cols))
         return cols
 
     raise FileNotFoundError(
-        "Cannot determine feature columns.\n"
-        f"  • {FEATURE_COLS_JSON} — not found\n"
-        f"  • Hopsworks schema read — failed (check HOPSWORKS_API_KEY secret)\n"
-        f"  • {LOCAL_FEATURES_CSV} — not found\n"
-        "Ensure the feature_pipeline step ran before inference_pipeline."
+        "Cannot determine feature columns. Tried:\n"
+        f"  1. {FEATURE_COLS_JSON}  — not found\n"
+        f"  2. Hopsworks model artifact 'lahore_aqi_best_24h'  — failed\n"
+        f"  3. {LOCAL_FEATURES_CSV}  — not found\n\n"
+        "Fix: re-run training_pipeline.py so feature_cols.json is uploaded "
+        "to the Hopsworks Model Registry, then retry inference."
     )
 
 
@@ -334,13 +345,7 @@ def store_predictions_hopsworks(api_key: str, prediction_row: dict) -> None:
     )
     df_pred = pd.DataFrame([prediction_row])
     df_pred["forecast_created_utc"] = pd.to_datetime(df_pred["forecast_created_utc"])
-    fg.insert(
-        df_pred,
-        write_options={
-            "start_offline_backfill": True,
-            "wait_for_job": True,
-        },
-    )
+    fg.insert(df_pred, write_options={"start_offline_backfill": True, "wait_for_job": True})
     logger.info("Stored prediction to Hopsworks '%s'", PRED_GROUP_NAME)
 
 
