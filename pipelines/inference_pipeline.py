@@ -79,28 +79,59 @@ AQI_CATEGORIES = [
 # ── Step 1: Load feature columns ──────────────────────────────────────────────
 
 def load_feature_cols() -> list:
-    """Fallback feature col loader for Ridge/LSTM models that don't store names."""
-    _EXCLUDE = {
-        "timestamp", "city",
-        "target_aqi_24h", "target_aqi_48h", "target_aqi_72h",
-        "us_aqi", "us_aqi_pm2_5",
-    }
+    """
+    Load feature columns — tries (in order):
+      1. Local models/feature_cols.json  (exists after training pipeline runs locally)
+      2. Hopsworks model artifact        (always available in CI — downloaded with the model)
+      3. Derive from local CSV           (last resort fallback)
+    """
+    # 1. Local file (works when running locally after training)
     if Path(FEATURE_COLS_JSON).exists():
         with open(FEATURE_COLS_JSON) as f:
             cols = json.load(f)
-        logger.info("Loaded %d feature columns from %s", len(cols), FEATURE_COLS_JSON)
+        logger.info("Loaded %d feature columns from local %s", len(cols), FEATURE_COLS_JSON)
         return cols
 
-    logger.warning("%s not found — deriving feature cols from CSV.", FEATURE_COLS_JSON)
+    # 2. Download from Hopsworks model artifact (works in GitHub Actions CI)
+    if USE_HOPSWORKS and HOPSWORKS_API_KEY:
+        try:
+            import hopsworks
+            logger.info("feature_cols.json not found locally — downloading from Hopsworks model artifact...")
+            project  = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
+            mr       = project.get_model_registry()
+            # Any horizon's model will have feature_cols.json — use 24h
+            hw_model = mr.get_model(name="lahore_aqi_best_24h", version=1)
+            save_dir = hw_model.download()
+            cols_path = os.path.join(save_dir, "feature_cols.json")
+            if Path(cols_path).exists():
+                with open(cols_path) as f:
+                    cols = json.load(f)
+                # Cache it locally so subsequent calls don't re-download
+                Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy(cols_path, FEATURE_COLS_JSON)
+                logger.info("Loaded %d feature columns from Hopsworks model artifact", len(cols))
+                return cols
+            else:
+                logger.warning("feature_cols.json not found inside Hopsworks model artifact at %s", save_dir)
+        except Exception as exc:
+            logger.warning("Could not load feature_cols.json from Hopsworks: %s", exc)
+
+    # 3. Derive from local CSV (last resort)
     if Path(LOCAL_FEATURES_CSV).exists():
         df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
-        cols = [c for c in df.columns if c not in _EXCLUDE]
-        logger.info("Derived %d feature columns from CSV header", len(cols))
+        exclude = {"timestamp", "city", "target_aqi_24h", "target_aqi_48h",
+                   "target_aqi_72h", "us_aqi", "us_aqi_pm2_5"}
+        cols = [c for c in df.columns if c not in exclude]
+        logger.info("Derived %d feature columns from CSV (last resort)", len(cols))
         return cols
 
     raise FileNotFoundError(
-        f"Cannot load feature columns: {FEATURE_COLS_JSON} and "
-        f"{LOCAL_FEATURES_CSV} both missing."
+        f"Cannot load feature columns:\n"
+        f"  {FEATURE_COLS_JSON} — missing\n"
+        f"  Hopsworks download failed\n"
+        f"  {LOCAL_FEATURES_CSV} — missing\n"
+        "Run training_pipeline.py first, or ensure Hopsworks credentials are set."
     )
 
 
