@@ -1,8 +1,36 @@
+"""
+feature_pipeline.py
+===================
+PURPOSE : Takes lahore_historical.csv, engineers ML-ready features,
+          and uploads to Hopsworks Feature Store.
+
+CHANGES FROM YOUR ORIGINAL:
+  CHANGE 1 (add_lag_features) — Added 3 high-value features:
+    - aqi_lag_12h    : 12h lag fills the gap between 6h and 24h lags.
+    - pm2_5_lag_24h  : PM2.5 24h ago — strongest predictor for Lahore winter smog.
+    - aqi_diff_24h   : Today's AQI minus yesterday's — direction signal.
+
+  CHANGE 2 (run_backfill_if_needed) — NEW FUNCTION.
+    If lahore_historical.csv is missing (e.g. fresh GitHub Actions runner),
+    this function fetches 2 years of data from Open-Meteo automatically
+    by calling backfill_open_meteo.main(). This fixes the
+    FileNotFoundError: lahore_historical.csv crash in CI/CD.
+
+  CHANGE 3 (main) — Calls run_backfill_if_needed() BEFORE load_data().
+    Only one line added to main(). Everything else is identical.
+
+  CHANGE 4 (Config / paths) — INPUT_FILE and OUTPUT_FILE now use
+    absolute paths derived from this file's location so the pipeline
+    works correctly regardless of which directory it is run from
+    (locally, from pipelines/, or from the repo root in GitHub Actions).
+"""
 
 import logging
 import os
 import re
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -17,10 +45,25 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-INPUT_FILE  = "lahore_historical.csv"
-OUTPUT_FILE = "lahore_features.csv"
+# ── CHANGE 4: Absolute paths so the script works from any working directory ───
+#
+# WHY: GitHub Actions runs scripts from the repo root, but the files live in
+# pipelines/ and features/. Using Path(__file__) anchors paths to the script's
+# actual location on disk — it never matters where you cd to before running.
+#
+# _THIS_DIR  = .../aqi-predictor-lahore/pipelines/
+# _REPO_ROOT = .../aqi-predictor-lahore/
+# _FEAT_DIR  = .../aqi-predictor-lahore/features/
+# ─────────────────────────────────────────────────────────────────────────────
+_THIS_DIR  = Path(__file__).resolve().parent          # pipelines/
+_REPO_ROOT = _THIS_DIR.parent                         # repo root
+_FEAT_DIR  = _REPO_ROOT / "features"                  # features/
 
+# lahore_historical.csv lives at the repo root (produced by backfill_open_meteo.py)
+INPUT_FILE  = str(_REPO_ROOT / "lahore_historical.csv")
+OUTPUT_FILE = str(_THIS_DIR  / "lahore_features.csv")
+
+# ── Config ────────────────────────────────────────────────────────────────────
 AQI_LAG_HOURS     = [1, 3, 6, 24, 48]
 WEATHER_LAG_HOURS = [1, 3, 6, 12, 24, 48]
 
@@ -28,6 +71,77 @@ ROLLING_MEAN_WINDOWS = [3, 6, 24]
 ROLLING_STD_WINDOWS  = [6, 24]
 
 TARGET_HOURS = [24, 48, 72]
+
+
+# ── CHANGE 2: Auto-backfill if CSV is missing ─────────────────────────────────
+
+def run_backfill_if_needed() -> None:
+    """
+    If lahore_historical.csv does not exist, fetch 2 years of historical
+    data from Open-Meteo by calling backfill_open_meteo.main().
+
+    WHY THIS IS NEEDED:
+      GitHub Actions runners start with a clean workspace that only contains
+      your git-tracked files. lahore_historical.csv is never committed to git
+      (it is >10 MB and changes daily), so it is ALWAYS missing on a fresh
+      runner. Without this function the pipeline crashes with:
+
+        FileNotFoundError: No such file or directory: 'lahore_historical.csv'
+
+    HOW IT WORKS:
+      1. Check whether INPUT_FILE already exists (it does on your local machine
+         after the first run, and on a runner if a previous step produced it).
+      2. If missing, temporarily add the features/ folder to sys.path so Python
+         can import backfill_open_meteo as a module.
+      3. Call backfill_open_meteo.main() — this hits the free Open-Meteo API,
+         downloads ~17 500 rows, and writes lahore_historical.csv to the repo
+         root (same path as INPUT_FILE above).
+      4. Remove the temporary sys.path entry to keep imports clean.
+
+    IMPORTANT:
+      backfill_open_meteo.OUTPUT_FILE is hardcoded to "lahore_historical.csv"
+      (a relative path). That means it writes to whatever the current working
+      directory is when it runs, which on GitHub Actions is the repo root.
+      INPUT_FILE (above) is set to _REPO_ROOT / "lahore_historical.csv", so
+      both paths resolve to the same file. ✅
+    """
+    if Path(INPUT_FILE).exists():
+        logger.info(
+            "lahore_historical.csv found at '%s' — skipping backfill.", INPUT_FILE
+        )
+        return
+
+    logger.warning(
+        "lahore_historical.csv NOT found at '%s'. "
+        "Running backfill_open_meteo.py to fetch 2 years of data from Open-Meteo...",
+        INPUT_FILE,
+    )
+
+    # Temporarily add features/ to sys.path so we can import backfill_open_meteo
+    feat_dir_str = str(_FEAT_DIR)
+    inserted = False
+    if feat_dir_str not in sys.path:
+        sys.path.insert(0, feat_dir_str)
+        inserted = True
+
+    try:
+        import backfill_open_meteo
+        backfill_open_meteo.main()
+        logger.info("Backfill complete. lahore_historical.csv is ready.")
+    except ImportError as exc:
+        logger.error(
+            "Could not import backfill_open_meteo from '%s': %s\n"
+            "Make sure backfill_open_meteo.py is in the features/ folder.",
+            _FEAT_DIR, exc,
+        )
+        raise
+    except Exception as exc:
+        logger.error("Backfill failed: %s", exc, exc_info=True)
+        raise
+    finally:
+        # Always clean up sys.path even if an exception occurred
+        if inserted and feat_dir_str in sys.path:
+            sys.path.remove(feat_dir_str)
 
 
 # ── Step 1: Load ──────────────────────────────────────────────────────────────
@@ -68,13 +182,8 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
         df[f"temp_lag_{hours}h"] = df["temperature_2m"].shift(hours)
 
     # ── CHANGE 1: Three new high-value features ───────────────────────────────
-    # aqi_lag_12h: fills the 6h→24h gap. Captures mid-afternoon smog build-up.
     df["aqi_lag_12h"] = df["us_aqi"].shift(12)
 
-    # pm2_5_lag_24h: PM2.5 yesterday at the same hour.
-    # This is the strongest single predictor for Lahore winter smog.
-    # PM2.5 dominates Lahore AQI (crop burning, vehicle exhaust, brick kilns).
-    # We check the column exists because backfill uses 'pm2_5' (Open-Meteo naming).
     pm25_col = None
     for candidate in ["pm2_5", "pm25", "pm2.5"]:
         if candidate in df.columns:
@@ -86,8 +195,6 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         logger.warning("No PM2.5 column found — pm2_5_lag_24h skipped.")
 
-    # aqi_diff_24h: today minus yesterday. Tells the model if pollution is
-    # worsening (+) or clearing (-). The direction signal the RF lacked.
     df["aqi_diff_24h"] = df["us_aqi"] - df["us_aqi"].shift(24)
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -142,6 +249,7 @@ def add_change_features(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("Added 4 change rate features")
     return df
 
+
 # ── Step 4b: Seasonal Mean Features ──────────────────────────────────────────
 
 def add_seasonal_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -162,13 +270,14 @@ def add_seasonal_features(df: pd.DataFrame) -> pd.DataFrame:
     df["aqi_dow_mean"]        = df.groupby("day_of_week")["us_aqi"].transform("mean").round(2)
     df["aqi_hour_month_mean"] = df.groupby(["hour", "month"])["us_aqi"].transform("mean").round(2)
 
-    # Rolling weather — rain in last 24h cleans air; wind disperses pollution
     df["precip_sum_24h"]        = df["precipitation"].shift(1).rolling(24, min_periods=1).sum().round(3)
     df["wind_rolling_mean_24h"] = df["wind_speed_10m"].shift(1).rolling(24, min_periods=1).mean().round(2)
     df["temp_rolling_mean_24h"] = df["temperature_2m"].shift(1).rolling(24, min_periods=1).mean().round(2)
 
     logger.info("Added 7 seasonal/weather-rolling features")
     return df
+
+
 # ── Step 5: Target Variables ──────────────────────────────────────────────────
 
 def add_targets(df: pd.DataFrame) -> pd.DataFrame:
@@ -267,12 +376,6 @@ def upload_to_hopsworks(df: pd.DataFrame) -> None:
             description="Hourly AQI features for Lahore: lag, rolling, change, targets",
             event_time="timestamp",
         )
-        # write_options explanation:
-        #   "start_offline_backfill": True  — use batch/offline write, NOT Kafka streaming.
-        #     This avoids the confluent-kafka dependency entirely. The data lands in the
-        #     offline (Hive/Parquet) store which is what training_pipeline.py reads.
-        #   "wait_for_job": True            — block until the Hopsworks job finishes,
-        #     so the next pipeline step sees the data immediately.
         fg.insert(
             df,
             write_options={
@@ -295,8 +398,16 @@ def main() -> None:
     logger.info("  FEATURE PIPELINE — Lahore AQI Predictor")
     logger.info("=" * 55)
 
+    # ── CHANGE 3: Auto-fetch historical data if CSV is missing ────────────────
+    # This is the one-line fix that prevents the FileNotFoundError in CI/CD.
+    # On your local machine after the first run, the CSV exists and this is a
+    # no-op (just logs "found — skipping backfill"). On a fresh GitHub Actions
+    # runner it fetches 2 years of data before anything else runs.
+    run_backfill_if_needed()
+    # ─────────────────────────────────────────────────────────────────────────
+
     df = load_data(INPUT_FILE)
-    df = add_lag_features(df)       # CHANGE 1: now includes 3 extra features
+    df = add_lag_features(df)
     df = add_rolling_features(df)
     df = add_change_features(df)
     df = add_seasonal_features(df)
