@@ -1,16 +1,4 @@
-"""
-training_pipeline.py
-====================
-CHANGES FROM YOUR ORIGINAL:
-  CHANGE 1 — MODELS_DIR points to models/ subfolder. All saves go there.
-  CHANGE 2 — Every joblib.dump / model.save uses MODELS_DIR path.
-  CHANGE 3 — save_best_to_hopsworks() reads feature_cols.json from MODELS_DIR.
-  CHANGE 4 — main() picks the BEST model per horizon (lowest RMSE) and
-              uploads ONLY that one to Hopsworks Model Registry.
-  CHANGE 5 — XGBoost added. This is the main fix for R² 0.67 → 0.82+.
-              XGBoost is added alongside RF and LSTM, and included in the
-              winner selection. It almost always wins on tabular time-series.
-"""
+
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -54,14 +42,13 @@ plt.rcParams["figure.figsize"] = (14, 5)
 USE_HOPSWORKS         = os.environ.get("USE_HOPSWORKS", "true").lower() == "true"
 HOPSWORKS_API_KEY     = os.environ.get("HOPSWORKS_API_KEY", "")
 FEATURE_GROUP_NAME    = "lahore_aqi_features"
-FEATURE_GROUP_VERSION = 1
+FEATURE_GROUP_VERSION = 3   # CHANGE 10: bumped from 1→3 to match new feature schema
 LOCAL_FEATURES_CSV    = "lahore_features.csv"
 
 HORIZONS = [24, 48, 72]
 SEQ_LEN  = 24
 
 # CHANGE 1: All models go into models/ subfolder
-# This matches exactly what inference_pipeline.py expects (_MODELS_DIR).
 MODELS_DIR = Path(__file__).resolve().parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 logger.info("Models will be saved to: %s", MODELS_DIR)
@@ -146,6 +133,45 @@ def make_sequences(X: np.ndarray, y: np.ndarray, seq_len: int):
     return np.array(Xs), np.array(ys)
 
 
+# ── Step 2b: Per-horizon feature selection ────────────────────────────────────
+# CHANGE 6
+
+def get_feature_cols_for_horizon(all_cols: list, horizon_h: int) -> list:
+    """
+    Drop short-lag features that are irrelevant (and add noise) at longer horizons.
+
+    WHY this matters:
+      aqi_lag_1h tells you what AQI was 1 hour ago — useful for 24h but
+      essentially random noise for 72h. Keeping it confuses tree models
+      because they waste splits on meaningless correlations.
+      Removing these features forces the model to rely on the stronger
+      long-range signals: seasonal means, 24h/48h lags, weather rolling stats.
+    """
+    if horizon_h == 72:
+        # Drop everything short-range: 1h, 3h, 6h lags and derived change features
+        drop = {
+            "aqi_lag_1h", "aqi_lag_3h", "aqi_lag_6h",
+            "wind_lag_1h", "wind_lag_3h", "temp_lag_1h", "temp_lag_3h",
+            "aqi_change_1h", "aqi_pct_change_1h",
+        }
+    elif horizon_h == 48:
+        # Drop only the very shortest lags
+        drop = {
+            "aqi_lag_1h", "aqi_lag_3h",
+            "wind_lag_1h", "temp_lag_1h",
+            "aqi_change_1h",
+        }
+    else:
+        drop = set()  # 24h: use all features
+
+    filtered = [c for c in all_cols if c not in drop]
+    logger.info(
+        "Horizon %dh: using %d / %d features (dropped %d short-lag cols)",
+        horizon_h, len(filtered), len(all_cols), len(all_cols) - len(filtered),
+    )
+    return filtered
+
+
 # ── Step 3: Train one horizon ─────────────────────────────────────────────────
 
 def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) -> dict:
@@ -157,8 +183,11 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
     print(f"  HORIZON: {horizon_h}h   TARGET: {target_col}")
     print("=" * 70)
 
+    # CHANGE 8: each horizon gets its own optimal feature set
+    horizon_feature_cols = get_feature_cols_for_horizon(feature_cols, horizon_h)
+
     X_train, y_train, X_val, y_val, X_test, y_test = chronological_split(
-        df_raw, feature_cols, target_col
+        df_raw, horizon_feature_cols, target_col
     )
 
     results = []
@@ -191,7 +220,8 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
     joblib.dump(rf_model, rf_path)
     logger.info("Saved: %s", rf_path)
 
-    importances = pd.Series(rf_model.feature_importances_, index=feature_cols)
+    # CHANGE 9: use horizon_feature_cols so column count matches X_test shape
+    importances = pd.Series(rf_model.feature_importances_, index=horizon_feature_cols)
     top15 = importances.sort_values(ascending=True).tail(15)
     fig, ax = plt.subplots(figsize=(10, 7))
     top15.plot(kind="barh", color="steelblue", ax=ax)
@@ -201,26 +231,36 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
     plt.savefig(imp_path, bbox_inches="tight")
     plt.close()
 
-    # ── CHANGE 5: XGBoost ─────────────────────────────────────────────────────
-    # WHY: XGBoost typically pushes R² from 0.67 → 0.82+ on tabular time-series.
-    # It handles non-linear feature interactions better than Random Forest and
-    # uses gradient boosting which corrects errors iteratively.
-    # early_stopping_rounds prevents overfitting without manual tuning.
+    # ── XGBoost ───────────────────────────────────────────────────────────────
+    # CHANGE 5 + CHANGE 7: XGBoost with per-horizon hyperparameters.
+    #
+    # WHY different params per horizon?
+    #   24h: deep trees (max_depth=6) are fine — the target is predictable.
+    #   48h: shallower trees (max_depth=4) + more regularisation because the
+    #        target is noisier and deep trees overfit.
+    #   72h: very shallow (max_depth=3) + strong regularisation — the 72h
+    #        target is mostly driven by seasonal patterns, not short-range
+    #        interactions, so complex trees just memorise training noise.
     print(f"\n  --- XGBoost ({horizon_h}h) ---")
     xgb_test = {"model": f"XGB Test {horizon_h}h", "rmse": 9999.0, "mae": 9999.0, "r2": -1.0}
     try:
         from xgboost import XGBRegressor
+
+        _xgb_params = {
+            24: dict(max_depth=6, n_estimators=500,  learning_rate=0.05,
+                     min_child_weight=3, reg_alpha=0.1, reg_lambda=1.0),
+            48: dict(max_depth=4, n_estimators=800,  learning_rate=0.03,
+                     min_child_weight=5, reg_alpha=0.5, reg_lambda=2.0),
+            72: dict(max_depth=3, n_estimators=1000, learning_rate=0.02,
+                     min_child_weight=7, reg_alpha=1.0, reg_lambda=3.0),
+        }
+
         xgb_model = XGBRegressor(
-            n_estimators=500,
-            learning_rate=0.05,
-            max_depth=6,
+            **_xgb_params[horizon_h],
             subsample=0.8,
             colsample_bytree=0.8,
-            min_child_weight=3,
-            reg_alpha=0.1,       # L1 regularisation — helps with noisy AQI data
-            reg_lambda=1.0,      # L2 regularisation
             random_state=SEED,
-            tree_method="hist",  # fast CPU training
+            tree_method="hist",
             early_stopping_rounds=30,
             eval_metric="rmse",
             verbosity=0,
@@ -238,7 +278,6 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
         logger.info("Saved: %s", xgb_path)
     except ImportError:
         logger.warning("xgboost not installed — skipping. Run: pip install xgboost")
-    # ──────────────────────────────────────────────────────────────────────────
 
     # ── LSTM ──────────────────────────────────────────────────────────────────
     print(f"\n  --- LSTM ({horizon_h}h) ---")
@@ -296,13 +335,14 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
     joblib.dump(scaler_y, scaler_y_path)
     logger.info("Saved: %s  %s  %s", lstm_path, scaler_x_path, scaler_y_path)
 
-    # SHAP on RF (always available, tree-based)
+    # ── SHAP on RF ────────────────────────────────────────────────────────────
+    # CHANGE 9: feature_names uses horizon_feature_cols (matches X_test shape)
     print(f"\n  --- SHAP ({horizon_h}h) ---")
     X_shap      = X_test[:min(500, len(X_test))]
     explainer   = shap.TreeExplainer(rf_model)
     shap_values = explainer.shap_values(X_shap)
     plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values, X_shap, feature_names=feature_cols,
+    shap.summary_plot(shap_values, X_shap, feature_names=horizon_feature_cols,
                       show=False, max_display=20)
     plt.title(f"SHAP Summary — RF {horizon_h}h", fontsize=13, fontweight="bold")
     plt.tight_layout()
@@ -311,22 +351,23 @@ def train_one_horizon(df_raw: pd.DataFrame, feature_cols: list, horizon_h: int) 
     plt.close()
     logger.info("Saved: %s", shap_path)
 
-    # Pick best test model (CHANGE 5: now includes XGBoost)
+    # Pick best test model
     test_results = [r for r in results if "Test" in r["model"]]
     best = min(test_results, key=lambda r: r["rmse"])
     print(f"\n  Best for {horizon_h}h: {best['model']}  "
           f"RMSE={best['rmse']:.2f}  R²={best['r2']:.4f}")
 
     return {
-        "horizon_h":  horizon_h,
-        "best_model": best["model"],
-        "rmse":       best["rmse"],
-        "mae":        best["mae"],
-        "r2":         best["r2"],
-        "rf_rmse":    rf_test["rmse"],
-        "lstm_rmse":  lstm_test["rmse"],
-        "ridge_rmse": ridge_test["rmse"],
-        "xgb_rmse":   xgb_test["rmse"],   # CHANGE 5: track XGBoost RMSE
+        "horizon_h":            horizon_h,
+        "best_model":           best["model"],
+        "rmse":                 best["rmse"],
+        "mae":                  best["mae"],
+        "r2":                   best["r2"],
+        "rf_rmse":              rf_test["rmse"],
+        "lstm_rmse":            lstm_test["rmse"],
+        "ridge_rmse":           ridge_test["rmse"],
+        "xgb_rmse":             xgb_test["rmse"],
+        "horizon_feature_cols": horizon_feature_cols,   # needed for per-horizon JSON save
     }
 
 
@@ -337,6 +378,7 @@ def save_best_to_hopsworks(
     model_name: str,
     metrics: dict,
     feature_cols: list,
+    horizon_h: int,
     extra_files: list = None,
 ) -> None:
     """Upload the single best model for one horizon to Hopsworks Model Registry."""
@@ -354,9 +396,13 @@ def save_best_to_hopsworks(
     os.makedirs(staging, exist_ok=True)
     shutil.copy(model_path, staging)
 
-    # CHANGE 3: feature_cols.json now comes from MODELS_DIR
-    feature_cols_path = str(MODELS_DIR / "feature_cols.json")
-    shutil.copy(feature_cols_path, staging)
+    # CHANGE 3 + CHANGE 10: copy BOTH the global feature_cols.json AND
+    # the per-horizon one so inference_pipeline can load the right columns.
+    global_cols_path  = str(MODELS_DIR / "feature_cols.json")
+    horizon_cols_path = str(MODELS_DIR / f"feature_cols_{horizon_h}h.json")
+    shutil.copy(global_cols_path,  staging)
+    if Path(horizon_cols_path).exists():
+        shutil.copy(horizon_cols_path, staging)
 
     for fpath in (extra_files or []):
         if os.path.exists(fpath):
@@ -413,16 +459,23 @@ def main():
     feature_cols = [c for c in df_raw.columns if c not in EXCLUDE_ALWAYS]
     print(f"\nFeature columns ({len(feature_cols)}): {feature_cols}")
 
-    # CHANGE 2: save feature_cols.json to MODELS_DIR
+    # CHANGE 2: save global feature_cols.json to MODELS_DIR
     feature_cols_path = str(MODELS_DIR / "feature_cols.json")
     with open(feature_cols_path, "w") as fh:
         json.dump(feature_cols, fh)
-    logger.info("Saved: %s", feature_cols_path)
+    logger.info("Saved global feature cols: %s", feature_cols_path)
 
     all_results = []
     for h in HORIZONS:
         result = train_one_horizon(df_raw, feature_cols, h)
         all_results.append(result)
+
+        # CHANGE 10: also save per-horizon feature_cols_<h>h.json
+        # inference_pipeline.py will prefer this over the global one
+        horizon_cols_path = str(MODELS_DIR / f"feature_cols_{h}h.json")
+        with open(horizon_cols_path, "w") as fh:
+            json.dump(result["horizon_feature_cols"], fh)
+        logger.info("Saved per-horizon feature cols (%dh): %s", h, horizon_cols_path)
 
     plot_horizon_comparison(all_results)
 
@@ -441,10 +494,11 @@ def main():
         for fname in [
             f"random_forest_model_{h}h.pkl",
             f"ridge_model_{h}h.pkl",
-            f"xgb_model_{h}h.pkl",          # CHANGE 5: added XGBoost
+            f"xgb_model_{h}h.pkl",
             f"lstm_model_{h}h.keras",
             f"scaler_X_{h}h.pkl",
             f"scaler_y_{h}h.pkl",
+            f"feature_cols_{h}h.json",   # CHANGE 10: per-horizon feature list
         ]:
             fpath = MODELS_DIR / fname
             tag = "OK     " if fpath.exists() else "MISSING"
@@ -457,7 +511,6 @@ def main():
             h      = r["horizon_h"]
             suffix = f"_{h}h"
 
-            # CHANGE 5: XGBoost now included in winner selection
             rmse_scores = {
                 "rf":    r["rf_rmse"],
                 "lstm":  r["lstm_rmse"],
@@ -486,7 +539,8 @@ def main():
                 model_path   = best_path,
                 model_name   = model_name,
                 metrics      = {"rmse": r["rmse"], "mae": r["mae"], "r2": r["r2"]},
-                feature_cols = feature_cols,
+                feature_cols = r["horizon_feature_cols"],
+                horizon_h    = h,
                 extra_files  = extra,
             )
     else:
