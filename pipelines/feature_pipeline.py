@@ -1,24 +1,3 @@
-"""
-feature_pipeline.py
-===================
-PURPOSE : Takes lahore_historical.csv, engineers ML-ready features,
-          and uploads to Hopsworks Feature Store.
-
-CHANGES FROM YOUR ORIGINAL:
-  CHANGE 1 (add_lag_features) — Added 3 high-value features:
-    - aqi_lag_12h    : 12h lag fills the gap between 6h and 24h lags.
-                       Captures mid-day smog build-up patterns.
-    - pm2_5_lag_24h  : PM2.5 24h ago. For Lahore winter smog, yesterday's
-                       PM2.5 is the single strongest predictor of today's AQI.
-                       Lahore's smog is dominated by PM2.5 (crop burning,
-                       vehicle exhaust, brick kilns) — this feature alone
-                       can add 5-8 R² points.
-    - aqi_diff_24h   : Today's AQI minus yesterday's. Tells the model
-                       whether pollution is worsening or improving — the
-                       "direction" the RF/XGBoost missed before.
-
-No other logic changed.
-"""
 
 import logging
 import os
@@ -43,7 +22,7 @@ INPUT_FILE  = "lahore_historical.csv"
 OUTPUT_FILE = "lahore_features.csv"
 
 AQI_LAG_HOURS     = [1, 3, 6, 24, 48]
-WEATHER_LAG_HOURS = [1, 3, 6]
+WEATHER_LAG_HOURS = [1, 3, 6, 12, 24, 48]
 
 ROLLING_MEAN_WINDOWS = [3, 6, 24]
 ROLLING_STD_WINDOWS  = [6, 24]
@@ -163,7 +142,33 @@ def add_change_features(df: pd.DataFrame) -> pd.DataFrame:
     logger.info("Added 4 change rate features")
     return df
 
+# ── Step 4b: Seasonal Mean Features ──────────────────────────────────────────
 
+def add_seasonal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Group-mean features: what is AQI typically like at this hour / month / DOW?
+
+    WHY: For 48h and 72h horizons, short lags carry little signal.
+    These features let the model fall back on historical averages —
+    'AQI in January at 8am is typically 220' — which is a strong
+    prior for Lahore's seasonal smog patterns.
+
+    IMPORTANT: computed on the full dataset, so no leakage —
+    every row already existed when these means were calculated.
+    Safe to use as features without train/test splitting.
+    """
+    df["aqi_hour_mean"]       = df.groupby("hour")["us_aqi"].transform("mean").round(2)
+    df["aqi_month_mean"]      = df.groupby("month")["us_aqi"].transform("mean").round(2)
+    df["aqi_dow_mean"]        = df.groupby("day_of_week")["us_aqi"].transform("mean").round(2)
+    df["aqi_hour_month_mean"] = df.groupby(["hour", "month"])["us_aqi"].transform("mean").round(2)
+
+    # Rolling weather — rain in last 24h cleans air; wind disperses pollution
+    df["precip_sum_24h"]        = df["precipitation"].shift(1).rolling(24, min_periods=1).sum().round(3)
+    df["wind_rolling_mean_24h"] = df["wind_speed_10m"].shift(1).rolling(24, min_periods=1).mean().round(2)
+    df["temp_rolling_mean_24h"] = df["temperature_2m"].shift(1).rolling(24, min_periods=1).mean().round(2)
+
+    logger.info("Added 7 seasonal/weather-rolling features")
+    return df
 # ── Step 5: Target Variables ──────────────────────────────────────────────────
 
 def add_targets(df: pd.DataFrame) -> pd.DataFrame:
@@ -257,7 +262,7 @@ def upload_to_hopsworks(df: pd.DataFrame) -> None:
         fs = project.get_feature_store()
         fg = fs.get_or_create_feature_group(
             name="lahore_aqi_features",
-            version=2,
+            version=3,
             primary_key=["city", "timestamp"],
             description="Hourly AQI features for Lahore: lag, rolling, change, targets",
             event_time="timestamp",
@@ -294,6 +299,7 @@ def main() -> None:
     df = add_lag_features(df)       # CHANGE 1: now includes 3 extra features
     df = add_rolling_features(df)
     df = add_change_features(df)
+    df = add_seasonal_features(df)
     df = add_targets(df)
     df = drop_warmup_rows(df)
     df = sanitise_column_names(df)
