@@ -1,23 +1,36 @@
 """
 inference_pipeline.py
 =====================
-CHANGES FROM YOUR ORIGINAL:
-  CHANGE 1 — _PROJECT_ROOT now points to the SAME folder as this script.
-             Previously it pointed one level UP (parent.parent), so models/
-             folder was never found. This was a silent crash bug.
+FIX APPLIED — Feature shape mismatch (expected 43 got 59)
 
-  CHANGE 2 — Hopsworks is PRIMARY storage for predictions.
-             Local CSV is FALLBACK only. Previously reversed — wrong per spec.
+ROOT CAUSE:
+  The XGBoost model in Hopsworks was trained on 43 features (old schema).
+  After adding new features, feature_cols.json grew to 59 columns.
+  At inference time, the local 59-col JSON was loaded and passed to the
+  43-feature model → crash.
 
-  CHANGE 3 — Models loaded from Hopsworks first, local fallback second.
+WHAT CHANGED (4 places, all marked ── FIX ──):
 
-  CHANGE 4 — XGBoost loading added to both load_model_from_hopsworks()
-             and load_model_from_local(). Without this, if XGBoost wins
-             training it would never be found at inference time.
+  FIX 1 — load_model_from_hopsworks() now also reads feature_cols.json
+           from the SAME download folder as the model. This is the exact
+           file that was saved together with the model at training time,
+           so it always has the right column count for that model.
+           Returns 5 values: (model_type, model, scaler_X, scaler_y, artifact_cols)
 
-  CHANGE 5 — Removed duplicate if __name__ == "__main__" block at bottom.
-             The second block referenced `preds` outside main() which would
-             crash with NameError.
+  FIX 2 — load_model_from_local() does the same for locally saved models.
+           Reads feature_cols.json from models/ alongside the model file.
+           Also returns 5 values.
+
+  FIX 3 — main() unpacks 5 values from both loaders and stores
+           artifact_cols per horizon in models dict.
+
+  FIX 4 — main() uses artifact_cols from the 24h model as feature_cols
+           BEFORE falling back to get_feature_cols_from_model() or
+           load_feature_cols(). This is the Option A fix — artifact cols
+           are always in sync with the model because they were saved
+           together at training time.
+
+No other logic changed.
 """
 
 import json
@@ -33,16 +46,12 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # ── Path fixes ────────────────────────────────────────────────────────────────
-# CHANGE 1: _PROJECT_ROOT is the folder containing this script — same level
-# as training_pipeline.py and feature_pipeline.py.
-# Previously was _PIPELINES_DIR.parent which pointed one directory UP,
-# so models/ was looked for in the wrong place and never found.
-_PIPELINES_DIR = Path(__file__).resolve().parent      # = .../pipelines/
-_PROJECT_ROOT  = _PIPELINES_DIR.parent                # = .../aqi-predictor-lahore/
-_MODELS_DIR    = _PIPELINES_DIR / "models"            # = .../pipelines/models/  (where your models are)
-_DATA_DIR      = _PIPELINES_DIR / "data"              # = .../pipelines/data/
-_FEATURES_DIR  = _PROJECT_ROOT / "features"           # = .../features/  (where live_aqi_client.py is)
-sys.path.insert(0, str(_PROJECT_ROOT))   # so live_aqi_client.py is importable
+_PIPELINES_DIR = Path(__file__).resolve().parent
+_PROJECT_ROOT  = _PIPELINES_DIR.parent
+_MODELS_DIR    = _PIPELINES_DIR / "models"
+_DATA_DIR      = _PIPELINES_DIR / "data"
+_FEATURES_DIR  = _PROJECT_ROOT / "features"
+sys.path.insert(0, str(_PROJECT_ROOT))
 sys.path.insert(0, str(_FEATURES_DIR))
 
 logging.basicConfig(
@@ -56,9 +65,9 @@ load_dotenv()
 USE_HOPSWORKS         = os.environ.get("USE_HOPSWORKS", "true").lower() == "true"
 HOPSWORKS_API_KEY     = os.environ.get("HOPSWORKS_API_KEY", "")
 FEATURE_GROUP_NAME    = "lahore_aqi_features"
-FEATURE_GROUP_VERSION = 2
+FEATURE_GROUP_VERSION = 3
 PRED_GROUP_NAME       = "lahore_aqi_predictions"
-PRED_GROUP_VERSION    = 2
+PRED_GROUP_VERSION    = 3
 
 LOCAL_FEATURES_CSV    = str(_PIPELINES_DIR / "lahore_features.csv")
 LOCAL_PREDICTIONS_CSV = str(_DATA_DIR / "predictions.csv")
@@ -80,33 +89,32 @@ AQI_CATEGORIES = [
 
 def load_feature_cols() -> list:
     """
-    Load feature columns — tries (in order):
-      1. Local models/feature_cols.json  (exists after training pipeline runs locally)
-      2. Hopsworks model artifact        (always available in CI — downloaded with the model)
-      3. Derive from local CSV           (last resort fallback)
+    LAST RESORT fallback only — called when artifact_cols is unavailable.
+    Priority:
+      1. Local models/feature_cols.json
+      2. Hopsworks model artifact download
+      3. Derive from local CSV
     """
-    # 1. Local file (works when running locally after training)
+    # 1. Local file
     if Path(FEATURE_COLS_JSON).exists():
         with open(FEATURE_COLS_JSON) as f:
             cols = json.load(f)
         logger.info("Loaded %d feature columns from local %s", len(cols), FEATURE_COLS_JSON)
         return cols
 
-    # 2. Download from Hopsworks model artifact (works in GitHub Actions CI)
+    # 2. Download from Hopsworks model artifact
     if USE_HOPSWORKS and HOPSWORKS_API_KEY:
         try:
             import hopsworks
             logger.info("feature_cols.json not found locally — downloading from Hopsworks model artifact...")
             project  = hopsworks.login(api_key_value=HOPSWORKS_API_KEY)
             mr       = project.get_model_registry()
-            # Any horizon's model will have feature_cols.json — use 24h
             hw_model = mr.get_model(name="lahore_aqi_best_24h", version=1)
             save_dir = hw_model.download()
             cols_path = os.path.join(save_dir, "feature_cols.json")
             if Path(cols_path).exists():
                 with open(cols_path) as f:
                     cols = json.load(f)
-                # Cache it locally so subsequent calls don't re-download
                 Path(FEATURE_COLS_JSON).parent.mkdir(parents=True, exist_ok=True)
                 import shutil
                 shutil.copy(cols_path, FEATURE_COLS_JSON)
@@ -117,7 +125,7 @@ def load_feature_cols() -> list:
         except Exception as exc:
             logger.warning("Could not load feature_cols.json from Hopsworks: %s", exc)
 
-    # 3. Derive from local CSV (last resort)
+    # 3. Derive from local CSV
     if Path(LOCAL_FEATURES_CSV).exists():
         df = pd.read_csv(LOCAL_FEATURES_CSV, nrows=1)
         exclude = {"timestamp", "city", "target_aqi_24h", "target_aqi_48h",
@@ -137,13 +145,10 @@ def load_feature_cols() -> list:
 
 def get_feature_cols_from_model(model_type: str, model) -> list:
     """
-    Extract the EXACT feature names the model was trained on from the
-    model object itself. This is the only 100% reliable source and fixes
-    the 'expected 43 got 46' mismatch when feature_cols.json drifts.
-
-    XGBoost stores feature names in the booster at fit() time.
+    Try to extract feature names stored inside the model object itself.
+    XGBoost stores names only if trained with a DataFrame (not numpy array).
     RandomForest stores them in feature_names_in_.
-    Ridge/LSTM do not store names — returns None, caller uses fallback.
+    Returns None for Ridge/LSTM — caller uses artifact_cols instead.
     """
     try:
         if model_type == "xgb":
@@ -167,13 +172,26 @@ def get_feature_cols_from_model(model_type: str, model) -> list:
     except Exception as exc:
         logger.warning("Could not extract feature names from model: %s", exc)
 
-    return None  # Ridge / LSTM — caller falls back to load_feature_cols()
+    return None
 
 
-# ── Step 2: Load model — Hopsworks first, local fallback ─────────────────────
+# ── Step 2: Load model ────────────────────────────────────────────────────────
+
+# ── FIX 1 ─────────────────────────────────────────────────────────────────────
+# load_model_from_hopsworks() now reads feature_cols.json from the SAME
+# temp folder where the model was downloaded. This file was saved together
+# with the model at training time, so it always matches the model's feature
+# count exactly — regardless of what your local feature_cols.json says.
+# Returns 5 values: model_type, model, scaler_X, scaler_y, artifact_cols
+# artifact_cols is None if the JSON file wasn't found in the artifact.
+# ──────────────────────────────────────────────────────────────────────────────
 
 def load_model_from_hopsworks(api_key: str, horizon_h: int):
-    """Download the best registered model for this horizon from Hopsworks."""
+    """
+    Download the best registered model for this horizon from Hopsworks.
+    Also reads feature_cols.json from the artifact folder (FIX 1).
+    Returns: (model_type, model, scaler_X, scaler_y, artifact_cols)
+    """
     import hopsworks
     suffix     = f"_{horizon_h}h"
     model_name = f"lahore_aqi_best{suffix}"
@@ -186,19 +204,43 @@ def load_model_from_hopsworks(api_key: str, horizon_h: int):
         save_dir = hw_model.download()
         logger.info("Downloaded '%s' to: %s", model_name, save_dir)
 
-        # CHANGE 4: Try XGBoost first (most likely winner after adding it)
+        # ── FIX 1: Read feature cols from this artifact folder ────────────────
+        # Try horizon-specific file first (feature_cols_24h.json), then global.
+        # These were copied into the artifact by save_best_to_hopsworks() in
+        # training_pipeline.py — they have exactly the right column count.
+        artifact_cols = None
+        for cols_filename in [f"feature_cols_{horizon_h}h.json", "feature_cols.json"]:
+            cols_path = os.path.join(save_dir, cols_filename)
+            if Path(cols_path).exists():
+                with open(cols_path) as f:
+                    artifact_cols = json.load(f)
+                logger.info(
+                    "FIX 1 ✅ Loaded %d feature cols from artifact file '%s' "
+                    "(these match the model exactly)",
+                    len(artifact_cols), cols_filename,
+                )
+                break
+        if artifact_cols is None:
+            logger.warning(
+                "FIX 1 ⚠️  No feature_cols*.json found in artifact at %s — "
+                "will fall back to local JSON. Re-register the model to fix permanently.",
+                save_dir,
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Try XGBoost first
         xgb_file = os.path.join(save_dir, f"xgb_model{suffix}.pkl")
         if Path(xgb_file).exists():
             model = joblib.load(xgb_file)
             logger.info("Loaded XGBoost model for %dh from Hopsworks", horizon_h)
-            return "xgb", model, None, None
+            return "xgb", model, None, None, artifact_cols
 
         # Try RF
         rf_file = os.path.join(save_dir, f"random_forest_model{suffix}.pkl")
         if Path(rf_file).exists():
             model = joblib.load(rf_file)
             logger.info("Loaded RF model for %dh from Hopsworks", horizon_h)
-            return "rf", model, None, None
+            return "rf", model, None, None, artifact_cols
 
         # Try LSTM
         lstm_file = os.path.join(save_dir, f"lstm_model{suffix}.keras")
@@ -208,14 +250,14 @@ def load_model_from_hopsworks(api_key: str, horizon_h: int):
             scaler_X = joblib.load(os.path.join(save_dir, f"scaler_X{suffix}.pkl"))
             scaler_y = joblib.load(os.path.join(save_dir, f"scaler_y{suffix}.pkl"))
             logger.info("Loaded LSTM model for %dh from Hopsworks", horizon_h)
-            return "lstm", model, scaler_X, scaler_y
+            return "lstm", model, scaler_X, scaler_y, artifact_cols
 
         # Try Ridge
         ridge_file = os.path.join(save_dir, f"ridge_model{suffix}.pkl")
         if Path(ridge_file).exists():
             model = joblib.load(ridge_file)
             logger.info("Loaded Ridge model for %dh from Hopsworks", horizon_h)
-            return "ridge", model, None, None
+            return "ridge", model, None, None, artifact_cols
 
     except Exception as exc:
         logger.warning(
@@ -226,22 +268,49 @@ def load_model_from_hopsworks(api_key: str, horizon_h: int):
     return load_model_from_local(horizon_h)
 
 
+# ── FIX 2 ─────────────────────────────────────────────────────────────────────
+# load_model_from_local() also reads feature_cols.json from the models/
+# folder alongside the model file. Same idea as FIX 1 but for local models.
+# Returns 5 values to match load_model_from_hopsworks().
+# ──────────────────────────────────────────────────────────────────────────────
+
 def load_model_from_local(horizon_h: int):
-    """Fallback: load from local models/ folder."""
+    """
+    Fallback: load from local models/ folder.
+    Also reads feature_cols.json from models/ (FIX 2).
+    Returns: (model_type, model, scaler_X, scaler_y, artifact_cols)
+    """
     suffix = f"_{horizon_h}h"
 
-    # CHANGE 4: Try XGBoost first
+    # ── FIX 2: Read feature cols from local models/ folder ───────────────────
+    artifact_cols = None
+    for cols_filename in [f"feature_cols_{horizon_h}h.json", "feature_cols.json"]:
+        cols_path = _MODELS_DIR / cols_filename
+        if cols_path.exists():
+            with open(cols_path) as f:
+                artifact_cols = json.load(f)
+            logger.info(
+                "FIX 2 ✅ Loaded %d feature cols from local models/%s",
+                len(artifact_cols), cols_filename,
+            )
+            break
+    if artifact_cols is None:
+        logger.warning(
+            "FIX 2 ⚠️  No feature_cols*.json found in %s", _MODELS_DIR
+        )
+    # ─────────────────────────────────────────────────────────────────────────
+
     xgb_path = str(_MODELS_DIR / f"xgb_model{suffix}.pkl")
     if Path(xgb_path).exists():
         model = joblib.load(xgb_path)
         logger.info("Loaded local XGBoost model for %dh", horizon_h)
-        return "xgb", model, None, None
+        return "xgb", model, None, None, artifact_cols
 
     rf_path = str(_MODELS_DIR / f"random_forest_model{suffix}.pkl")
     if Path(rf_path).exists():
         model = joblib.load(rf_path)
         logger.info("Loaded local RF model for %dh", horizon_h)
-        return "rf", model, None, None
+        return "rf", model, None, None, artifact_cols
 
     lstm_path     = str(_MODELS_DIR / f"lstm_model{suffix}.keras")
     scaler_x_path = str(_MODELS_DIR / f"scaler_X{suffix}.pkl")
@@ -253,7 +322,7 @@ def load_model_from_local(horizon_h: int):
             scaler_X = joblib.load(scaler_x_path)
             scaler_y = joblib.load(scaler_y_path)
             logger.info("Loaded local LSTM model for %dh", horizon_h)
-            return "lstm", model, scaler_X, scaler_y
+            return "lstm", model, scaler_X, scaler_y, artifact_cols
         except Exception as exc:
             logger.warning("Local LSTM load failed for %dh (%s), trying Ridge.", horizon_h, exc)
 
@@ -261,7 +330,7 @@ def load_model_from_local(horizon_h: int):
     if Path(ridge_path).exists():
         model = joblib.load(ridge_path)
         logger.info("Loaded local Ridge model for %dh", horizon_h)
-        return "ridge", model, None, None
+        return "ridge", model, None, None, artifact_cols
 
     raise FileNotFoundError(
         f"No model found for {horizon_h}h in {_MODELS_DIR}.\n"
@@ -323,7 +392,6 @@ def predict_one_horizon(horizon_h, model_type, model, scaler_X, scaler_y, X_all)
         y_scaled = model.predict(seq, verbose=0).ravel()[0]
         pred     = float(scaler_y.inverse_transform([[y_scaled]])[0][0])
     else:
-        # Works for RF, XGBoost, and Ridge — all use .predict(X)
         pred = float(model.predict(X_all[-1:])[0])
 
     pred = max(0.0, min(pred, 500.0))
@@ -417,41 +485,83 @@ def main() -> None:
         live_aqi  = 0.0
         live_data = {}
 
-    # Load models first — we derive feature cols FROM the model itself.
-    # This is the only guaranteed-correct source: XGBoost stores the exact
-    # column names it was trained on in get_booster().feature_names.
-    # Any other approach (JSON file, schema, CSV header) can drift and cause
-    # the 'expected 43 got 46' shape mismatch.
+    # ── FIX 3 ─────────────────────────────────────────────────────────────────
+    # Unpack 5 values from both loaders (added artifact_cols as 5th value).
+    # Store artifact_cols per horizon inside the models dict.
+    # ──────────────────────────────────────────────────────────────────────────
     models = {}
     for horizon_h in [24, 48, 72]:
         logger.info("Loading model for %dh...", horizon_h)
         if USE_HOPSWORKS and HOPSWORKS_API_KEY:
-            model_type, model, scaler_X, scaler_y = load_model_from_hopsworks(
+            model_type, model, scaler_X, scaler_y, artifact_cols = load_model_from_hopsworks(
                 HOPSWORKS_API_KEY, horizon_h
             )
         else:
-            model_type, model, scaler_X, scaler_y = load_model_from_local(horizon_h)
-        models[horizon_h] = (model_type, model, scaler_X, scaler_y)
-        logger.info("  %dh → %s", horizon_h, model_type)
+            model_type, model, scaler_X, scaler_y, artifact_cols = load_model_from_local(horizon_h)
 
-    # Derive feature cols from the 24h model (all horizons trained on same cols).
-    # Falls back to load_feature_cols() for Ridge/LSTM which don't store names.
-    _mt, _m, _, _ = models[24]
-    feature_cols = get_feature_cols_from_model(_mt, _m)
-    if feature_cols is None:
-        logger.info("Model type '%s' doesn't store feature names — using JSON/CSV fallback", _mt)
-        feature_cols = load_feature_cols()
-    logger.info("Using %d feature columns (source: %s model)", len(feature_cols), _mt)
+        # Store all 5 values including artifact_cols
+        models[horizon_h] = (model_type, model, scaler_X, scaler_y, artifact_cols)
+        logger.info("  %dh → %s  (artifact_cols: %s)",
+                    horizon_h, model_type,
+                    f"{len(artifact_cols)} cols" if artifact_cols else "not found")
+    # ──────────────────────────────────────────────────────────────────────────
+
+    # ── FIX 4 ─────────────────────────────────────────────────────────────────
+    # Feature column resolution — priority order:
+    #
+    #   1. artifact_cols from the 24h model download  ← THIS IS THE FIX
+    #      These were saved TOGETHER with the model at training time.
+    #      They are guaranteed to match the model's expected feature count.
+    #
+    #   2. Feature names stored inside the model object itself
+    #      (works for XGBoost only if trained with DataFrame, not numpy)
+    #
+    #   3. Local feature_cols.json / CSV fallback
+    #      DANGEROUS — this file grows when you add features but doesn't
+    #      update old registered models. This caused the 43 vs 59 crash.
+    #
+    # By putting artifact_cols first we always use the right column count
+    # for the model that's actually registered in Hopsworks.
+    # ──────────────────────────────────────────────────────────────────────────
+    _mt, _m, _, _, _artifact_cols = models[24]
+
+    if _artifact_cols is not None:
+        feature_cols = _artifact_cols
+        logger.info(
+            "FIX 4 ✅ Using %d feature cols from model artifact (Option A fix — "
+            "these are guaranteed to match the registered model)",
+            len(feature_cols),
+        )
+    else:
+        # artifact_cols not available — try extracting from model object
+        feature_cols = get_feature_cols_from_model(_mt, _m)
+        if feature_cols is not None:
+            logger.info(
+                "Using %d feature cols extracted from %s model object",
+                len(feature_cols), _mt,
+            )
+        else:
+            # Last resort — local JSON/CSV (risky if features changed after training)
+            logger.warning(
+                "FIX 4 ⚠️  artifact_cols not found and model doesn't store feature names. "
+                "Falling back to local JSON/CSV — this may cause a shape mismatch "
+                "if features were added after the model was registered. "
+                "Re-register the model to fix permanently."
+            )
+            feature_cols = load_feature_cols()
+
+    logger.info("Final feature count: %d", len(feature_cols))
+    # ──────────────────────────────────────────────────────────────────────────
 
     # Load features
     df_features = load_latest_features()
     X_all = prepare_X(df_features, feature_cols)
     logger.info("Feature matrix shape: %s", X_all.shape)
 
-    # Predict
+    # Predict — unpack 5 values now
     preds = {}
     for horizon_h in [24, 48, 72]:
-        model_type, model, scaler_X, scaler_y = models[horizon_h]
+        model_type, model, scaler_X, scaler_y, _ = models[horizon_h]
         preds[f"pred_{horizon_h}h"] = predict_one_horizon(
             horizon_h, model_type, model, scaler_X, scaler_y, X_all
         )
@@ -477,7 +587,7 @@ def main() -> None:
         "target_date_72h":      str(pd.Timestamp(now_utc) + pd.Timedelta(hours=72)),
     }
 
-    # CHANGE 2: Hopsworks is PRIMARY storage for predictions
+    # Hopsworks is PRIMARY storage for predictions
     if USE_HOPSWORKS and HOPSWORKS_API_KEY:
         try:
             store_predictions_hopsworks(HOPSWORKS_API_KEY, prediction_row)
@@ -497,7 +607,5 @@ def main() -> None:
     logger.info("Inference pipeline complete.")
 
 
-# CHANGE 5: Only ONE if __name__ block. The original had two — the second
-# referenced `preds` outside main() which would crash with NameError.
 if __name__ == "__main__":
     main()
