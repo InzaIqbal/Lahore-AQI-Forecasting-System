@@ -8,7 +8,7 @@
 
 | Resource | Link |
 |----------|------|
-| 🖥️ Live Dashboard | [aeroforecast.streamlit.app](https://aeroforecast.streamlit.app) |
+| 🖥️ Live Dashboard | [ https://lahore-aqi-forecasting-system-vyn8ysdekqpafskbvubspd.streamlit.app]
 | 📦 Feature Store | Hopsworks — `lahore_aqi_features` v3 |
 | 🤖 Model Registry | Hopsworks — `lahore_aqi_best_24h/48h/72h` v1 |
 
